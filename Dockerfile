@@ -1,15 +1,22 @@
-FROM node:20-slim
+# Stage 1: Build binary warp-go langsung dari source
+FROM golang:1.22-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /build
+RUN git clone https://gitlab.com/ProjectWARP/warp-go.git . && \
+    go build -v -ldflags "-w -s" -o warp-go
+
+# Stage 2: Runtime Node.js
+FROM node:20-alpine
 
 WORKDIR /app
 
-# 1. Install curl & ca-certificates
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates tar && \
-    rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
-# 2. Download binary warp-go langsung dari mirror fscarmen
-RUN curl -fsSL https://raw.githubusercontent.com/fscarmen/warp/main/warp-go/warp-go_linux_amd64 -o /usr/local/bin/warp-go && \
-    chmod +x /usr/local/bin/warp-go
+# Salin binary yang sudah ter-compile dari Stage 1
+COPY --from=builder /build/warp-go /usr/local/bin/warp-go
+RUN chmod +x /usr/local/bin/warp-go
 
 COPY package.json ./
 RUN npm install --production
