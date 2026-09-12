@@ -1,16 +1,15 @@
-FROM node:20-alpine
+FROM node:20-slim
 
 WORKDIR /app
 
-# 1. Install curl & libc compatibility (gcompat) agar binary Go bisa jalan di Alpine
-RUN apk add --no-cache curl tar ca-certificates gcompat
+# 1. Install curl & ca-certificates
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates tar && \
+    rm -rf /var/lib/apt/lists/*
 
-# 2. Download binary warp-go langsung dari mirror GitHub release yang valid
-RUN curl -fsSL https://github.com/bEpI-gOiNg/warp-go/releases/download/v1.0.8/warp-go_linux_amd64.tar.gz -o warp-go.tar.gz && \
-    tar -xzf warp-go.tar.gz && \
-    chmod +x warp-go && \
-    mv warp-go /usr/local/bin/ && \
-    rm warp-go.tar.gz
+# 2. Download binary warp-go langsung dari mirror fscarmen
+RUN curl -fsSL https://raw.githubusercontent.com/fscarmen/warp/main/warp-go/warp-go_linux_amd64 -o /usr/local/bin/warp-go && \
+    chmod +x /usr/local/bin/warp-go
 
 COPY package.json ./
 RUN npm install --production
