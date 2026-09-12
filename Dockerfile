@@ -1,22 +1,18 @@
-# Stage 1: Build binary warp-go langsung dari source
-FROM golang:1.22-alpine AS builder
-
-RUN apk add --no-cache git
-
-WORKDIR /build
-RUN git clone https://gitlab.com/ProjectWARP/warp-go.git . && \
-    go build -v -ldflags "-w -s" -o warp-go
-
-# Stage 2: Runtime Node.js
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates
+# 1. Install gpg, curl, ca-certificates
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl gpg ca-certificates procps && \
+    rm -rf /var/lib/apt/lists/*
 
-# Salin binary yang sudah ter-compile dari Stage 1
-COPY --from=builder /build/warp-go /usr/local/bin/warp-go
-RUN chmod +x /usr/local/bin/warp-go
+# 2. Pasang GPG key & repo resmi Cloudflare WARP
+RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" | tee /etc/apt/sources.list.d/cloudflare-client.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends cloudflare-warp && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY package.json ./
 RUN npm install --production
@@ -26,4 +22,5 @@ COPY . .
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["sh", "-c", "warp-go --register --config=warp.conf 2>/dev/null || true; warp-go --config=warp.conf --socks=127.0.0.1:40000 & sleep 2; node server.js"]
+# 3. Jalankan warp-svc di background, set mode proxy (port 40000), konek, lalu start node
+CMD ["sh", "-c", "warp-svc & sleep 3 && warp-cli --accept-tos registration new 2>/dev/null || true && warp-cli --accept-tos mode proxy && warp-cli --accept-tos proxy port 40000 && warp-cli --accept-tos connect && sleep 2 && node server.js"]
