@@ -15,7 +15,7 @@ const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
 const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT || '';
 const DB_PATH = path.resolve(process.env.DATA_DIR || './', 'proxy_data.json');
 
-// --- KONFIGURASI XUDP RELAY ENGINE ---
+// --- XUDP ENGINE CONFIG ---
 const RELAY_CONFIG = Object.freeze({
   WS_PATH: '/',
   MAX_WS_MESSAGE_BYTES: 4 * 1024 * 1024,
@@ -23,7 +23,7 @@ const RELAY_CONFIG = Object.freeze({
   IDLE_TIMEOUT_MS: 300000,
   XUDP_GRACE_MS: 60000,
   MAX_CONNECTIONS: 4096,
-  REJECT_UDP_443: false, // QUIC port 443 tetap diizinkan
+  REJECT_UDP_443: false,
 });
 
 const RELAY_MAGIC = Buffer.from('VLRLY004', 'ascii');
@@ -82,13 +82,11 @@ function loadData() {
       if (data.rawTcpConfig) RAW_TCP_CONFIG = { ...RAW_TCP_CONFIG, ...data.rawTcpConfig };
       if (Array.isArray(data.users)) {
         proxyUsers.clear();
-        for (const [u, p] of data.users) {
-          proxyUsers.set(u, p);
-        }
+        for (const [u, p] of data.users) proxyUsers.set(u, p);
       }
     }
   } catch (err) {
-    console.error('[Storage Error] Failed to read database:', err.message);
+    console.error('[Storage Error]', err.message);
   }
 }
 
@@ -102,10 +100,9 @@ function saveData() {
     };
     fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (err) {
-    console.error('[Storage Error] Failed to save database:', err.message);
+    console.error('[Storage Error]', err.message);
   }
 }
-
 loadData();
 
 let PROXY_SERVER_INFO = {
@@ -139,7 +136,6 @@ let globalTotalBytesIn = 0;
 let globalTotalBytesOut = 0;
 const dnsCache = new Map();
 
-// STATS XUDP RELAY
 const RELAY_STATS = {
   activeClients: 0,
   totalHandshakes: 0,
@@ -152,20 +148,14 @@ const RELAY_STATS = {
 async function resolveDomain(hostname) {
   const now = Date.now();
   const cached = dnsCache.get(hostname);
-  if (cached && (now - cached.time < 1000 * 60 * 10)) {
-    return cached.ip;
-  }
-
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) {
-    return hostname;
-  }
+  if (cached && (now - cached.time < 1000 * 60 * 10)) return cached.ip;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return hostname;
 
   if (DNS_CONFIG.mode === 'DOH') {
     try {
       const url = new URL(DNS_CONFIG.dohUrl);
       url.searchParams.set('name', hostname);
       url.searchParams.set('type', 'A');
-
       const res = await fetch(url.toString(), {
         headers: { 'Accept': 'application/dns-json' },
         signal: AbortSignal.timeout(1800)
@@ -214,27 +204,14 @@ function checkHttpAuth(dataStr) {
   if (!match) return false;
   try {
     const creds = Buffer.from(match[1], 'base64').toString('utf-8').split(':');
-    const u = creds[0];
-    const p = creds.slice(1).join(':');
-    return proxyUsers.has(u) && proxyUsers.get(u) === p;
+    return proxyUsers.has(creds[0]) && proxyUsers.get(creds[0]) === creds.slice(1).join(':');
   } catch (_) {
     return false;
   }
 }
 
-function parseRequestBody(raw) {
-  const delimiterIndex = raw.indexOf('\r\n\r\n');
-  if (delimiterIndex === -1) return {};
-  const bodyStr = raw.slice(delimiterIndex + 4);
-  try {
-    return JSON.parse(bodyStr);
-  } catch (_) {
-    return {};
-  }
-}
-
 // ==========================================
-// 1. ENGINE XUDP / MUX RELAY
+// 1. ENGINE XUDP RELAY
 // ==========================================
 function rejectUdpTarget(target) {
   return Boolean(RELAY_CONFIG.REJECT_UDP_443 && Number(target?.port) === 443);
@@ -319,10 +296,6 @@ async function readEndpoint(reader) {
   const port = head.readUInt16BE(0);
   const atyp = head[2];
   if (port === 0) throw new Error('zero port');
-  return readEndpointBody(reader, atyp, port);
-}
-
-async function readEndpointBody(reader, atyp, port) {
   if (atyp === ATYP_IPV4) {
     const b = await reader.readExactly(4);
     return { host: `${b[0]}.${b[1]}.${b[2]}.${b[3]}`, port, atyp };
@@ -331,10 +304,7 @@ async function readEndpointBody(reader, atyp, port) {
     const len = (await reader.readExactly(1))[0];
     if (len === 0) throw new Error('empty domain');
     const b = await reader.readExactly(len);
-    let host;
-    try { host = utf8Fatal.decode(b); } catch { throw new Error('invalid UTF-8 domain'); }
-    if (!host) throw new Error('empty domain');
-    return { host, port, atyp };
+    return { host: utf8Fatal.decode(b), port, atyp };
   }
   if (atyp === ATYP_IPV6) {
     const b = await reader.readExactly(16);
@@ -352,23 +322,18 @@ function parseEndpointBytes(buffer, offset) {
   if (atyp === ATYP_IPV4) {
     if (buffer.length - cursor < 4) throw new Error('unexpected EOF in IPv4');
     const b = buffer.subarray(cursor, cursor + 4);
-    cursor += 4;
-    return { endpoint: { host: `${b[0]}.${b[1]}.${b[2]}.${b[3]}`, port, atyp }, next: cursor };
+    return { endpoint: { host: `${b[0]}.${b[1]}.${b[2]}.${b[3]}`, port, atyp }, next: cursor + 4 };
   }
   if (atyp === ATYP_DOMAIN) {
-    if (buffer.length - cursor < 1) throw new Error('unexpected EOF in domain length');
     const len = buffer[cursor++];
     if (len === 0 || buffer.length - cursor < len) throw new Error('invalid domain length');
-    let host;
-    try { host = utf8Fatal.decode(buffer.subarray(cursor, cursor + len)); } catch { throw new Error('invalid UTF-8 domain'); }
-    cursor += len;
-    return { endpoint: { host, port, atyp }, next: cursor };
+    const host = utf8Fatal.decode(buffer.subarray(cursor, cursor + len));
+    return { endpoint: { host, port, atyp }, next: cursor + len };
   }
   if (atyp === ATYP_IPV6) {
     if (buffer.length - cursor < 16) throw new Error('unexpected EOF in IPv6');
     const host = formatIPv6(buffer.subarray(cursor, cursor + 16));
-    cursor += 16;
-    return { endpoint: { host, port, atyp }, next: cursor };
+    return { endpoint: { host, port, atyp }, next: cursor + 16 };
   }
   throw new Error(`unknown address type ${atyp}`);
 }
@@ -380,16 +345,7 @@ function formatIPv6(bytes) {
 }
 
 function ipv6ToBytes(address) {
-  let input = address;
-  const zone = input.indexOf('%');
-  if (zone >= 0) input = input.slice(0, zone);
-  let ipv4Tail = null;
-  const lastColon = input.lastIndexOf(':');
-  if (input.includes('.') && lastColon >= 0) {
-    const ipv4 = input.slice(lastColon + 1).split('.').map(Number);
-    ipv4Tail = [((ipv4[0] << 8) | ipv4[1]).toString(16), ((ipv4[2] << 8) | ipv4[3]).toString(16)];
-    input = input.slice(0, lastColon) + ':' + ipv4Tail.join(':');
-  }
+  let input = address.split('%')[0];
   const halves = input.split('::');
   const left = halves[0] ? halves[0].split(':').filter(Boolean) : [];
   const right = halves.length === 2 && halves[1] ? halves[1].split(':').filter(Boolean) : [];
@@ -409,11 +365,8 @@ function encodeUDPSource(rinfo) {
     head[2] = ATYP_IPV4;
     return Buffer.concat([head, Buffer.from(rinfo.address.split('.').map(Number))]);
   }
-  if (family === 6) {
-    head[2] = ATYP_IPV6;
-    return Buffer.concat([head, ipv6ToBytes(rinfo.address)]);
-  }
-  throw new Error(`invalid UDP source IP: ${rinfo.address}`);
+  head[2] = ATYP_IPV6;
+  return Buffer.concat([head, ipv6ToBytes(rinfo.address)]);
 }
 
 function writeSocket(socket, data) {
@@ -421,25 +374,6 @@ function writeSocket(socket, data) {
   return new Promise((resolve, reject) => {
     socket.write(data, (err) => err ? reject(err) : resolve());
   });
-}
-
-async function writeControlError(socket, message) {
-  let body = Buffer.from(String(message || 'relay error'), 'utf8');
-  if (body.length > MAX_PACKET_LEN) body = body.subarray(0, MAX_PACKET_LEN);
-  const out = Buffer.allocUnsafe(3 + body.length);
-  out[0] = 1;
-  out.writeUInt16BE(body.length, 1);
-  body.copy(out, 3);
-  try { await writeSocket(socket, out); } catch {}
-}
-
-async function readControl(reader) {
-  const magic = await reader.readExactly(RELAY_MAGIC.length);
-  if (!magic.equals(RELAY_MAGIC)) throw new Error('bad magic');
-  const mode = (await reader.readExactly(1))[0];
-  if (![RELAY_MODE_FIXED_UDP, RELAY_MODE_MUX, RELAY_MODE_PACKET_UDP].includes(mode)) throw new Error('bad mode');
-  const target = mode === RELAY_MODE_FIXED_UDP ? await readEndpoint(reader) : null;
-  return { mode, target };
 }
 
 function bindDgram(socket, port, address) {
@@ -500,13 +434,11 @@ class UDPAssociation {
   }
 
   async send(target, payload) {
-    if (this.closed) throw new Error('UDP association is closed');
-    if (payload.length > MAX_PACKET_LEN) throw new Error('UDP payload too large');
-
+    if (this.closed) return;
     let resolvedIp = await resolveDomain(target.host);
     const isV6 = net.isIP(resolvedIp) === 6;
     const socket = isV6 ? this.udp6 : this.udp4;
-    if (!socket) throw new Error('UDP socket unavailable');
+    if (!socket) return;
 
     await new Promise((resolve, reject) => {
       socket.send(payload, target.port, resolvedIp, (err) => err ? reject(err) : resolve());
@@ -563,28 +495,17 @@ class XUDPManager {
     if (!entry || !entry.assoc.detach(mux, sessionID)) return;
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = setTimeout(() => {
-      const current = this.entries.get(key);
-      if (current !== entry) return;
-      this.entries.delete(key);
-      entry.assoc.close();
+      if (this.entries.get(key) === entry) {
+        this.entries.delete(key);
+        entry.assoc.close();
+      }
     }, this.graceMs);
     entry.timer.unref?.();
-  }
-
-  close() {
-    for (const entry of this.entries.values()) {
-      if (entry.timer) clearTimeout(entry.timer);
-      entry.assoc.close();
-    }
-    this.entries.clear();
   }
 }
 
 async function serveDirectUDP(socket, reader, target) {
-  if (rejectUdpTarget(target)) {
-    await writeControlError(socket, 'UDP/443 rejected');
-    return;
-  }
+  if (rejectUdpTarget(target)) return;
   const assoc = await UDPAssociation.create();
   let closed = false;
   assoc.attach({
@@ -692,7 +613,7 @@ class MuxSession {
   }
 
   async sendUDP(target, payload) {
-    if (!this.udp) throw new Error('UDP session unavailable');
+    if (!this.udp) return;
     await this.udp.send(target, payload);
   }
 
@@ -789,11 +710,7 @@ class MuxConnection {
 
   async handleKeep(frame) {
     const session = this.sessions.get(frame.id);
-    if (!session) {
-      await this.sendEnd(frame.id, false).catch(() => {});
-      return;
-    }
-    if (!frame.data.length) return;
+    if (!session || !frame.data.length) return;
     let target = session.target;
     if (frame.network === MUX_NETWORK_UDP && frame.target?.host && frame.target?.port) {
       target = frame.target;
@@ -816,9 +733,8 @@ class MuxConnection {
   closeAll() {
     if (this.closed) return;
     this.closed = true;
-    const sessions = [...this.sessions.values()];
+    for (const s of this.sessions.values()) s.closeWithoutRemoving();
     this.sessions.clear();
-    for (const session of sessions) session.closeWithoutRemoving();
   }
 
   _queueWrite(data) {
@@ -847,7 +763,7 @@ class MuxConnection {
   }
 
   writeMuxPacket(meta, data) {
-    if (data.length > MAX_PACKET_LEN) return Promise.reject(new Error('mux payload too large'));
+    if (data.length > MAX_PACKET_LEN) return Promise.reject(new Error('payload too large'));
     const out = Buffer.allocUnsafe(2 + meta.length + 2 + data.length);
     out.writeUInt16BE(meta.length, 0);
     meta.copy(out, 2);
@@ -866,7 +782,7 @@ class MuxConnection {
 }
 
 // ==========================================
-// 2. WEBSOCKET PROTOCOL ENCAPSULATION
+// 2. WEBSOCKET ADAPTER
 // ==========================================
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 function websocketAccept(key) {
@@ -896,8 +812,6 @@ class WebSocketRelaySocket extends EventEmitter {
   constructor(raw, maxMessageBytes) {
     super();
     this.raw = raw;
-    this.remoteAddress = raw.remoteAddress;
-    this.remotePort = raw.remotePort;
     this.destroyed = false;
     this.writable = true;
     this.buffer = Buffer.alloc(0);
@@ -960,13 +874,12 @@ class WebSocketRelaySocket extends EventEmitter {
       if (this.buffer.length < 2) return;
       const b0 = this.buffer[0];
       const b1 = this.buffer[1];
-      const fin = Boolean(b0 & 0x80);
       const opcode = b0 & 0x0f;
       const masked = Boolean(b1 & 0x80);
       let length = b1 & 0x7f;
       let offset = 2;
 
-      if (!masked) { this.destroy(new Error('client frames must be masked')); return; }
+      if (!masked) { this.destroy(new Error('unmasked client frame')); return; }
       if (length === 126) {
         if (this.buffer.length < 4) return;
         length = this.buffer.readUInt16BE(2);
@@ -1002,34 +915,12 @@ class WebSocketRelaySocket extends EventEmitter {
 
 const xm = new XUDPManager(RELAY_CONFIG.XUDP_GRACE_MS);
 
-async function handleRelayWsConnection(socket) {
-  const reader = new AsyncByteReader(socket);
-  socket.setNoDelay(true);
-  socket.setTimeout(RELAY_CONFIG.HANDSHAKE_TIMEOUT_MS, () => socket.destroy(new Error('handshake timeout')));
-  try {
-    const control = await readControl(reader);
-    RELAY_STATS.totalHandshakes++;
-    socket.setTimeout(RELAY_CONFIG.IDLE_TIMEOUT_MS, () => socket.destroy(new Error('idle timeout')));
-    if (control.mode === RELAY_MODE_FIXED_UDP) {
-      await serveDirectUDP(socket, reader, control.target);
-    } else if (control.mode === RELAY_MODE_PACKET_UDP) {
-      await servePacketUDP(socket, reader);
-    } else {
-      const mux = new MuxConnection(socket, reader, xm);
-      await mux.serve();
-    }
-  } catch (err) {
-    socket.destroy();
-  }
-}
-
 // ==========================================
-// 3. HTTP / SOCKS5 / TCP PROXY HANDLER
+// 3. HTTP APP SERVER (DASHBOARD, API & CONNECT)
 // ==========================================
-const server = http.createServer(async (req, res) => {
+const httpApp = http.createServer((req, res) => {
   const pathUrl = req.url || '/';
 
-  // REST API: Set DNS
   if (pathUrl.startsWith('/api/set-dns') && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
@@ -1064,7 +955,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // REST API: Set Raw TCP
   if (pathUrl === '/api/set-raw-tcp' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
@@ -1085,7 +975,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // REST API: Manage Users
   if (pathUrl === '/api/manage-users' && req.method === 'POST') {
     let body = '';
     req.on('data', c => body += c);
@@ -1112,19 +1001,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // REST API: Stats
   if (pathUrl === '/api/stats') {
-    const activeList = Array.from(activeConnections.values())
-      .filter(c => !c.target.includes('railway.com') && !c.target.includes('up.railway.app'))
-      .map(c => ({
-        id: c.id,
-        clientIp: c.clientIp,
-        type: c.type,
-        target: c.target,
-        uptime: Math.floor((Date.now() - c.startTime) / 1000),
-        bytesIn: formatBytes(c.bytesIn),
-        bytesOut: formatBytes(c.bytesOut)
-      }));
+    const activeList = Array.from(activeConnections.values()).map(c => ({
+      id: c.id,
+      clientIp: c.clientIp,
+      type: c.type,
+      target: c.target,
+      uptime: Math.floor((Date.now() - c.startTime) / 1000),
+      bytesIn: formatBytes(c.bytesIn),
+      bytesOut: formatBytes(c.bytesOut)
+    }));
 
     const userObjects = [];
     proxyUsers.forEach((pass, user) => userObjects.push({ username: user, password: pass }));
@@ -1147,18 +1033,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Dashboard Web UI
   if (pathUrl === '/' || pathUrl === '/index.html') {
-    const html = renderDashboardHTML();
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
+    res.end(renderDashboardHTML());
     return;
   }
 
   // HTTP Forward Proxy
   const authHeader = req.headers['proxy-authorization'] || '';
   if (!checkHttpAuth(`Proxy-Authorization: ${authHeader}`)) {
-    res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Proxy Auth"', 'Content-Length': 0 });
+    res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Proxy Auth"', 'Content-Length': '0' });
     res.end();
     return;
   }
@@ -1168,8 +1052,7 @@ const server = http.createServer(async (req, res) => {
   const targetHost = parts[0];
   const targetPort = parseInt(parts[1], 10) || 80;
 
-  try {
-    const resolvedIp = await resolveDomain(targetHost);
+  resolveDomain(targetHost).then((resolvedIp) => {
     const targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
       targetSocket.setNoDelay(true);
       res.writeHead(200);
@@ -1177,13 +1060,11 @@ const server = http.createServer(async (req, res) => {
       targetSocket.pipe(res);
     });
     targetSocket.on('error', () => { res.writeHead(502); res.end(); });
-  } catch (_) {
-    res.writeHead(500); res.end();
-  }
+  }).catch(() => { res.writeHead(500); res.end(); });
 });
 
-// UPGRADE LISTENER: WEBSOCKET XUDP RELAY
-server.on('upgrade', (req, rawSocket, head) => {
+// UPGRADE: WEBSOCKET XUDP RELAY
+httpApp.on('upgrade', (req, rawSocket, head) => {
   const upgrade = String(req.headers.upgrade || '').toLowerCase();
   const key = String(req.headers['sec-websocket-key'] || '');
   if (upgrade !== 'websocket' || !key) {
@@ -1205,12 +1086,28 @@ server.on('upgrade', (req, rawSocket, head) => {
   });
 
   const wsSocket = new WebSocketRelaySocket(rawSocket, RELAY_CONFIG.MAX_WS_MESSAGE_BYTES);
-  handleRelayWsConnection(wsSocket).catch(() => wsSocket.destroy());
+  const reader = new AsyncByteReader(wsSocket);
+  wsSocket.setNoDelay(true);
+  wsSocket.setTimeout(RELAY_CONFIG.HANDSHAKE_TIMEOUT_MS, () => wsSocket.destroy(new Error('timeout')));
+
+  readControl(reader).then(async (control) => {
+    RELAY_STATS.totalHandshakes++;
+    wsSocket.setTimeout(RELAY_CONFIG.IDLE_TIMEOUT_MS, () => wsSocket.destroy(new Error('idle timeout')));
+    if (control.mode === RELAY_MODE_FIXED_UDP) {
+      await serveDirectUDP(wsSocket, reader, control.target);
+    } else if (control.mode === RELAY_MODE_PACKET_UDP) {
+      await servePacketUDP(wsSocket, reader);
+    } else {
+      const mux = new MuxConnection(wsSocket, reader, xm);
+      await mux.serve();
+    }
+  }).catch(() => wsSocket.destroy());
+
   wsSocket.feedHead(head);
 });
 
-// HTTPS CONNECT TUNNEL (DIPAKAI WORKER DI PATH /vless/IP:PORT)
-server.on('connect', async (req, clientSocket, head) => {
+// HTTPS CONNECT TUNNEL (DIPAKAI WORKER UNTUK TRAFIK TCP)
+httpApp.on('connect', async (req, clientSocket, head) => {
   clientSocket.setNoDelay(true);
   clientSocket.setKeepAlive(true, 5000);
 
@@ -1229,13 +1126,12 @@ server.on('connect', async (req, clientSocket, head) => {
   const connData = {
     id: connId,
     clientIp,
-    type: 'HTTPS TUNNEL (WORKER TCP)',
+    type: 'WORKER TCP (CONNECT)',
     target: `${targetHost}:${targetPort}`,
     startTime: Date.now(),
     bytesIn: 0,
     bytesOut: 0
   };
-
   activeConnections.set(connId, connData);
 
   try {
@@ -1245,14 +1141,8 @@ server.on('connect', async (req, clientSocket, head) => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) targetSocket.write(head);
 
-      clientSocket.on('data', d => {
-        connData.bytesIn += d.length;
-        globalTotalBytesIn += d.length;
-      });
-      targetSocket.on('data', d => {
-        connData.bytesOut += d.length;
-        globalTotalBytesOut += d.length;
-      });
+      clientSocket.on('data', d => { connData.bytesIn += d.length; globalTotalBytesIn += d.length; });
+      targetSocket.on('data', d => { connData.bytesOut += d.length; globalTotalBytesOut += d.length; });
 
       clientSocket.pipe(targetSocket);
       targetSocket.pipe(clientSocket);
@@ -1263,55 +1153,53 @@ server.on('connect', async (req, clientSocket, head) => {
       clientSocket.destroy();
       targetSocket.destroy();
     };
-
     clientSocket.on('error', cleanup);
     targetSocket.on('error', cleanup);
     clientSocket.on('close', cleanup);
     targetSocket.on('close', cleanup);
-  } catch (err) {
+  } catch (_) {
     clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
     clientSocket.end();
   }
 });
 
-// RAW TCP / SOCKS5 FALLBACK LISTENER
-server.on('connection', (clientSocket) => {
-  clientSocket.once('data', async (chunk) => {
-    // 1. SOCKS5 Protocol Handshake
-    if (chunk[0] === 0x05) {
-      handleSocks5Connection(clientSocket, chunk);
+// ==========================================
+// 4. PROTOCOL DEMUX MASTER (STREAM CLEAN ROUTER)
+// ==========================================
+const masterServer = net.createServer({ noDelay: true }, (socket) => {
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 5000);
+
+  socket.once('data', async (firstChunk) => {
+    // 1. SOCKS5
+    if (firstChunk[0] === 0x05) {
+      handleSocks5Connection(socket, firstChunk);
       return;
     }
 
-    // 2. HTTP Methods (dilepas ke listener HTTP default)
-    const firstString = chunk.slice(0, 8).toString('ascii');
-    if (/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|CONNECT)\s/i.test(firstString)) {
-      clientSocket.unshift(chunk);
+    // 2. HTTP / WEBSOCKET UPGRADE / CONNECT
+    const prefix = firstChunk.slice(0, 8).toString('ascii');
+    if (/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|CONNECT)\s/i.test(prefix)) {
+      socket.pause();
+      httpApp.emit('connection', socket);
+      socket.unshift(firstChunk);
+      socket.resume();
       return;
     }
 
-    // 3. RAW TCP / SNI Router / VLESS TLS Mentah
-    const sni = parseTlsSni(chunk);
-    let destHost = '';
-    let destPort = 443;
-
-    if (sni) {
-      destHost = sni;
-    } else if (RAW_TCP_CONFIG.enabled) {
-      destHost = RAW_TCP_CONFIG.defaultTargetHost;
-      destPort = RAW_TCP_CONFIG.defaultTargetPort;
-    } else {
-      destHost = 'speed.cloudflare.com';
-    }
+    // 3. RAW TCP / SNI ROUTER
+    const sni = parseTlsSni(firstChunk);
+    let destHost = sni || (RAW_TCP_CONFIG.enabled ? RAW_TCP_CONFIG.defaultTargetHost : 'speed.cloudflare.com');
+    let destPort = sni ? 443 : (RAW_TCP_CONFIG.enabled ? RAW_TCP_CONFIG.defaultTargetPort : 443);
 
     const connId = ++connectionIdCounter;
     const connData = {
       id: connId,
-      clientIp: (clientSocket.remoteAddress || '').replace('::ffff:', ''),
+      clientIp: (socket.remoteAddress || '').replace('::ffff:', ''),
       type: sni ? 'VLESS/TLS (SNI)' : 'RAW TCP MENTAH',
       target: `${destHost}:${destPort}`,
       startTime: Date.now(),
-      bytesIn: chunk.length,
+      bytesIn: firstChunk.length,
       bytesOut: 0
     };
     activeConnections.set(connId, connData);
@@ -1319,25 +1207,25 @@ server.on('connection', (clientSocket) => {
     try {
       const resolvedIp = await resolveDomain(destHost);
       const targetSocket = net.connect({ host: resolvedIp, port: destPort, noDelay: true }, () => {
-        targetSocket.write(chunk);
-        clientSocket.pipe(targetSocket);
-        targetSocket.pipe(clientSocket);
+        targetSocket.write(firstChunk);
+        socket.pipe(targetSocket);
+        targetSocket.pipe(socket);
       });
 
-      clientSocket.on('data', d => { connData.bytesIn += d.length; globalTotalBytesIn += d.length; });
+      socket.on('data', d => { connData.bytesIn += d.length; globalTotalBytesIn += d.length; });
       targetSocket.on('data', d => { connData.bytesOut += d.length; globalTotalBytesOut += d.length; });
 
       const cleanup = () => {
         activeConnections.delete(connId);
-        clientSocket.destroy();
+        socket.destroy();
         targetSocket.destroy();
       };
-      clientSocket.on('error', cleanup);
+      socket.on('error', cleanup);
       targetSocket.on('error', cleanup);
-      clientSocket.on('close', cleanup);
+      socket.on('close', cleanup);
       targetSocket.on('close', cleanup);
     } catch (_) {
-      clientSocket.destroy();
+      socket.destroy();
     }
   });
 });
@@ -1537,7 +1425,6 @@ function renderDashboardHTML() {
       </div>
     </div>
 
-    <!-- PANEL PENGATURAN DNS RESOLVER -->
     <div class="panel" style="border-color:#38bdf8;">
       <div class="section-title" style="margin:0; color:#38bdf8;">🌐 PENGATURAN DNS RESOLVER</div>
       <div class="hint">Resolusi domain untuk koneksi TCP & UDP Relay:</div>
@@ -1564,7 +1451,6 @@ function renderDashboardHTML() {
       <div id="dns_toast" class="toast">✅ DNS Berhasil Disimpan!</div>
     </div>
 
-    <!-- PANEL RAW TCP -->
     <div class="panel" style="border-color:#a855f7;">
       <div class="section-title" style="margin:0; color:#c084fc;">🛠️ KONTROL PROXY RAW TCP</div>
       <select id="raw_tcp_switch">
@@ -1576,7 +1462,6 @@ function renderDashboardHTML() {
       <button style="background:#a855f7; color:#fff;" onclick="saveRawTcp()">💾 SIMPAN RAW TCP</button>
     </div>
 
-    <!-- PANEL AUTHENTICATION -->
     <div class="panel">
       <div class="section-title" style="margin:0;">👤 AUTHENTICATION</div>
       <select id="select_auth_mode" onchange="changeAuthMode()">
@@ -1591,7 +1476,6 @@ function renderDashboardHTML() {
       <button onclick="addUser()">+ TAMBAH USER</button>
     </div>
 
-    <!-- LIVE CONNECTIONS -->
     <div class="section-title">🟢 LIVE CONNECTIONS (REALTIME)</div>
     <div class="conn-list" id="conn_container"></div>
   </div>
@@ -1729,6 +1613,6 @@ function renderDashboardHTML() {
 </html>`;
 }
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Unified Server] Proxy (TCP/HTTP/RAW) & XUDP Relay (WS) listening on port ${PORT}`);
+masterServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Master Demux] Listening on port ${PORT} (HTTP, WS, SOCKS5, RAW TCP)`);
 });
