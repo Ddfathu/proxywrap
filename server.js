@@ -1,4 +1,5 @@
 import net from 'net';
+import dgram from 'dgram';
 import dns from 'dns';
 import fs from 'fs';
 import path from 'path';
@@ -10,7 +11,7 @@ const DB_PATH = path.resolve(process.env.DATA_DIR || './', 'proxy_data.json');
 
 // --- STATE MANAGEMENT ---
 const proxyUsers = new Map(); 
-let PROXY_AUTH_MODE = 'NONE'; // Default langsung publik tanpa auth agar mudah tes
+let PROXY_AUTH_MODE = 'NONE';
 
 let RAW_TCP_CONFIG = {
   enabled: true,
@@ -213,6 +214,7 @@ const server = net.createServer({
 
   let isFirstPacket = true;
   let targetSocket = null;
+  let udpRelay = null;
   let socksState = 0;
   let httpBuffer = '';
 
@@ -241,7 +243,7 @@ const server = net.createServer({
     sockB.on('close', cleanup);
   };
 
-  // --- SOCKS5 HANDLER ---
+  // --- SOCKS5 HANDLER (TCP CONNECT & UDP ASSOCIATE) ---
   const handleSocks5 = async (chunk) => {
     if (socksState === 0) {
       const nmethods = chunk[1];
@@ -280,7 +282,105 @@ const server = net.createServer({
     }
 
     if (socksState === 2) {
-      if (chunk[0] !== 0x05 || chunk[1] !== 0x01) {
+      const cmd = chunk[1]; // 0x01 = CONNECT (TCP), 0x03 = UDP ASSOCIATE (QUIC/UDP)
+
+      if (cmd === 0x03) {
+        // --- FITUR QUIC UDP RELAY ---
+        connData.type = 'SOCKS5 UDP (QUIC)';
+        connData.target = 'UDP Associate Relay';
+        activeConnections.set(connId, connData);
+
+        udpRelay = dgram.createSocket('udp4');
+        let clientUdpAddr = null;
+
+        udpRelay.on('message', async (msg, rinfo) => {
+          // Tangkap paket dari browser client
+          if (!clientUdpAddr) {
+            clientUdpAddr = { address: rinfo.address, port: rinfo.port };
+          }
+
+          if (rinfo.address === clientUdpAddr.address && rinfo.port === clientUdpAddr.port) {
+            // Header SOCKS5 UDP: [RSV(2), FRAG(1), ATYP(1), DST.ADDR, DST.PORT]
+            if (msg.length < 10) return;
+            const atyp = msg[3];
+            let offset = 4;
+            let destHost = '';
+
+            if (atyp === 0x01) { // IPv4
+              destHost = `${msg[4]}.${msg[5]}.${msg[6]}.${msg[7]}`;
+              offset += 4;
+            } else if (atyp === 0x03) { // Domain
+              const dlen = msg[4];
+              destHost = msg.slice(5, 5 + dlen).toString();
+              offset += 1 + dlen;
+            } else {
+              return;
+            }
+
+            const destPort = msg.readUInt16BE(offset);
+            offset += 2;
+            const payload = msg.slice(offset);
+
+            connData.bytesIn += payload.length;
+            globalTotalBytesIn += payload.length;
+
+            try {
+              const targetIp = await resolveDomain(destHost);
+              udpRelay.send(payload, destPort, targetIp);
+            } catch (_) {}
+          } else {
+            // Tangkap respon UDP dari server remote lalu bungkus balik ke format SOCKS5 UDP
+            const resHeader = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+            const ipParts = Buffer.from(rinfo.address.split('.').map(x => parseInt(x, 10)));
+            const portBuf = Buffer.alloc(2);
+            portBuf.writeUInt16BE(rinfo.port);
+
+            const outboundPacket = Buffer.concat([resHeader, ipParts, portBuf, msg]);
+            connData.bytesOut += msg.length;
+            globalTotalBytesOut += msg.length;
+
+            if (clientUdpAddr) {
+              udpRelay.send(outboundPacket, clientUdpAddr.port, clientUdpAddr.address);
+            }
+          }
+        });
+
+        udpRelay.bind(0, () => {
+          const relayPort = udpRelay.address().port;
+          const boundAddr = clientSocket.localAddress || '0.0.0.0';
+          const ipParts = boundAddr.includes('.') ? boundAddr.split('.').map(x => parseInt(x, 10)) : [0, 0, 0, 0];
+
+          // Kirim balasan SOCKS5 sukses ke browser: Berikan port UDP yang siap menerima paket QUIC
+          const reply = Buffer.alloc(10);
+          reply[0] = 0x05; // VER
+          reply[1] = 0x00; // SUCCESS
+          reply[2] = 0x00; // RSV
+          reply[3] = 0x01; // IPv4
+          reply[4] = ipParts[0];
+          reply[5] = ipParts[1];
+          reply[6] = ipParts[2];
+          reply[7] = ipParts[3];
+          reply.writeUInt16BE(relayPort, 8);
+          clientSocket.write(reply);
+        });
+
+        // Kontrol TCP tetap terbuka sampai client memutuskan sesi
+        clientSocket.on('close', () => {
+          if (udpRelay) {
+            try { udpRelay.close(); } catch (_) {}
+          }
+          activeConnections.delete(connId);
+        });
+        clientSocket.on('error', () => {
+          if (udpRelay) {
+            try { udpRelay.close(); } catch (_) {}
+          }
+        });
+        return;
+      }
+
+      // Standar SOCKS5 TCP CONNECT (0x01)
+      if (cmd !== 0x01) {
         clientSocket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
         return clientSocket.end();
       }
@@ -458,7 +558,7 @@ const server = net.createServer({
           return;
         }
 
-        // Dashboard Web UI (Tampil Langsung)
+        // Dashboard Web UI
         if (pathUrl === '/' || pathUrl === '/index.html') {
           const html = renderDashboardHTML();
           clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(html)}\r\nConnection: close\r\n\r\n${html}`);
@@ -562,8 +662,16 @@ const server = net.createServer({
     }
   });
 
-  clientSocket.on('error', () => { activeConnections.delete(connId); if (targetSocket) targetSocket.destroy(); });
-  clientSocket.on('close', () => { activeConnections.delete(connId); if (targetSocket) targetSocket.destroy(); });
+  clientSocket.on('error', () => { 
+    activeConnections.delete(connId); 
+    if (targetSocket) targetSocket.destroy(); 
+    if (udpRelay) { try { udpRelay.close(); } catch (_) {} }
+  });
+  clientSocket.on('close', () => { 
+    activeConnections.delete(connId); 
+    if (targetSocket) targetSocket.destroy(); 
+    if (udpRelay) { try { udpRelay.close(); } catch (_) {} }
+  });
 });
 
 function parseTlsSni(buffer) {
@@ -647,7 +755,7 @@ function renderDashboardHTML() {
     
     <div class="proxy-box">
       <div>
-        <div class="proxy-title">🚀 Endpoint Proxy (HTTP/S, SOCKS5, RAW TCP)</div>
+        <div class="proxy-title">🚀 Endpoint Proxy (HTTP/S, SOCKS5 + UDP, RAW TCP)</div>
         <div class="proxy-val" id="proxy_full_text">${PROXY_SERVER_INFO.fullProxy || 'Loading...'}</div>
       </div>
       <button class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('proxy_full_text').innerText)">📋 SALIN</button>
@@ -673,7 +781,6 @@ function renderDashboardHTML() {
       </div>
     </div>
 
-    <!-- PANEL 1: PENGATURAN DNS RESOLVER (SELALU TERBUKA) -->
     <div class="panel" style="border-color:#38bdf8;">
       <div class="section-title" style="margin:0; color:#38bdf8;">🌐 PENGATURAN DNS RESOLVER</div>
       <div class="hint">Pilih preset DoH/UDP atau custom untuk mempercepat pemutaran YouTube:</div>
@@ -706,7 +813,6 @@ function renderDashboardHTML() {
       <div id="dns_toast" class="toast">✅ DNS Berhasil Diperbarui & Cache Direset!</div>
     </div>
 
-    <!-- PANEL 2: KONTROL RAW TCP PROXY (SELALU TERBUKA) -->
     <div class="panel" style="border-color:#a855f7;">
       <div class="section-title" style="margin:0; color:#c084fc;">🛠️ KONTROL PROXY RAW TCP</div>
       <label style="font-size:0.75rem; color:#94a3b8; margin-top:8px; display:block;">Status Raw TCP:</label>
@@ -724,7 +830,6 @@ function renderDashboardHTML() {
       <button style="background:#a855f7; color:#fff;" onclick="saveRawTcp()">💾 SIMPAN PENGATURAN RAW TCP</button>
     </div>
 
-    <!-- PANEL 3: USER & AUTHENTICATION SETTINGS (SELALU TERBUKA) -->
     <div class="panel">
       <div class="section-title" style="margin:0;">👤 USER & PASSWORD PROXY</div>
       <div class="hint">Gunakan mode NONE untuk public/bebas auth:</div>
@@ -748,7 +853,6 @@ function renderDashboardHTML() {
       <button onclick="addUser()">+ TAMBAH USER PROXY</button>
     </div>
 
-    <!-- LIVE CONNECTIONS -->
     <div class="section-title">🟢 LIVE CONNECTIONS (REALTIME)</div>
     <div class="conn-list" id="conn_container"></div>
   </div>
