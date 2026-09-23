@@ -1,8 +1,10 @@
 import net from 'net';
+import tls from 'tls';
 import dgram from 'dgram';
 import dns from 'dns';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 
 const PORT = process.env.PORT || 8080;
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
@@ -10,7 +12,7 @@ const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT || '';
 const DB_PATH = path.resolve(process.env.DATA_DIR || './', 'proxy_data.json');
 
 // --- STATE MANAGEMENT ---
-const proxyUsers = new Map(); 
+const proxyUsers = new Map();
 let PROXY_AUTH_MODE = 'NONE';
 
 let RAW_TCP_CONFIG = {
@@ -25,6 +27,15 @@ let DNS_CONFIG = {
   dohUrl: 'https://cloudflare-dns.com/dns-query',
   udpServer: '1.1.1.1',
   udpPort: 53
+};
+
+// Pengaturan Upstream Worker VLESS / XUDP Relay
+let WORKER_RELAY_CONFIG = {
+  enabled: true,
+  host: process.env.WORKER_HOST || 'namaworker-kamu.workers.dev',
+  port: parseInt(process.env.WORKER_PORT, 10) || 443,
+  wsPath: process.env.WORKER_WS_PATH || '/',
+  useTls: true
 };
 
 const PRESETS = {
@@ -45,6 +56,7 @@ function loadData() {
       if (data.authMode) PROXY_AUTH_MODE = data.authMode;
       if (data.dnsConfig) DNS_CONFIG = data.dnsConfig;
       if (data.rawTcpConfig) RAW_TCP_CONFIG = { ...RAW_TCP_CONFIG, ...data.rawTcpConfig };
+      if (data.workerRelayConfig) WORKER_RELAY_CONFIG = { ...WORKER_RELAY_CONFIG, ...data.workerRelayConfig };
       if (Array.isArray(data.users)) {
         proxyUsers.clear();
         for (const [u, p] of data.users) {
@@ -63,6 +75,7 @@ function saveData() {
       authMode: PROXY_AUTH_MODE,
       dnsConfig: DNS_CONFIG,
       rawTcpConfig: RAW_TCP_CONFIG,
+      workerRelayConfig: WORKER_RELAY_CONFIG,
       users: Array.from(proxyUsers.entries())
     };
     fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), 'utf-8');
@@ -188,6 +201,206 @@ function parseRequestBody(raw) {
   }
 }
 
+// ==========================================
+// CLIENT ENGINE: UDP TO WS XUDP TUNNEL BRIDGE
+// ==========================================
+const RELAY_MAGIC = Buffer.from('VLRLY004', 'ascii');
+const RELAY_MODE_PACKET_UDP = 0x03;
+
+class XUdpWorkerTunnel {
+  constructor(onDataCallback) {
+    this.wsSocket = null;
+    this.isReady = false;
+    this.connecting = false;
+    this.onDataCallback = onDataCallback;
+    this.inBuffer = Buffer.alloc(0);
+    this.isUpgraded = false;
+  }
+
+  connect() {
+    if (this.isReady || this.connecting) return;
+    this.connecting = true;
+    this.isUpgraded = false;
+    this.inBuffer = Buffer.alloc(0);
+
+    const protocol = WORKER_RELAY_CONFIG.useTls ? tls : net;
+    const socket = protocol.connect({
+      host: WORKER_RELAY_CONFIG.host,
+      port: WORKER_RELAY_CONFIG.port,
+      servername: WORKER_RELAY_CONFIG.host,
+      rejectUnauthorized: false
+    }, () => {
+      const key = crypto.randomBytes(16).toString('base64');
+      const req = [
+        `GET ${WORKER_RELAY_CONFIG.wsPath} HTTP/1.1`,
+        `Host: ${WORKER_RELAY_CONFIG.host}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Key: ${key}`,
+        'Sec-WebSocket-Version: 13',
+        '\r\n'
+      ].join('\r\n');
+      socket.write(req);
+    });
+
+    socket.on('data', (chunk) => {
+      this.inBuffer = Buffer.concat([this.inBuffer, chunk]);
+
+      if (!this.isUpgraded) {
+        const headerEnd = this.inBuffer.indexOf('\r\n\r\n');
+        if (headerEnd !== -1) {
+          const headerStr = this.inBuffer.slice(0, headerEnd).toString();
+          if (headerStr.includes('101 Switching Protocols')) {
+            this.isUpgraded = true;
+            this.inBuffer = this.inBuffer.slice(headerEnd + 4);
+            this.wsSocket = socket;
+            this.isReady = true;
+            this.connecting = false;
+
+            // Inisialisasi Handshake VLRLY004 + Mode Packet UDP (0x03)
+            const controlHeader = Buffer.concat([RELAY_MAGIC, Buffer.from([RELAY_MODE_PACKET_UDP])]);
+            this.sendWsFrame(controlHeader);
+          } else {
+            socket.destroy();
+          }
+        }
+        return;
+      }
+
+      this.parseIncomingWsFrames();
+    });
+
+    const cleanup = () => {
+      this.isReady = false;
+      this.connecting = false;
+      this.isUpgraded = false;
+      this.wsSocket = null;
+    };
+
+    socket.on('error', cleanup);
+    socket.on('close', cleanup);
+  }
+
+  parseIncomingWsFrames() {
+    while (this.inBuffer.length >= 2) {
+      const b0 = this.inBuffer[0];
+      const b1 = this.inBuffer[1];
+      const opcode = b0 & 0x0f;
+      const masked = Boolean(b1 & 0x80);
+      let len = b1 & 0x7f;
+      let offset = 2;
+
+      if (len === 126) {
+        if (this.inBuffer.length < 4) return;
+        len = this.inBuffer.readUInt16BE(2);
+        offset = 4;
+      } else if (len === 127) {
+        if (this.inBuffer.length < 10) return;
+        len = Number(this.inBuffer.readBigUInt64BE(2));
+        offset = 10;
+      }
+
+      let mask = null;
+      if (masked) {
+        if (this.inBuffer.length < offset + 4) return;
+        mask = this.inBuffer.subarray(offset, offset + 4);
+        offset += 4;
+      }
+
+      if (this.inBuffer.length < offset + len) return;
+
+      let payload = this.inBuffer.subarray(offset, offset + len);
+      this.inBuffer = this.inBuffer.subarray(offset + len);
+
+      if (masked && mask) {
+        const unmasked = Buffer.allocUnsafe(len);
+        for (let i = 0; i < len; i++) unmasked[i] = payload[i] ^ mask[i % 4];
+        payload = unmasked;
+      }
+
+      if (opcode === 0x02 && this.onDataCallback) {
+        // Lewatkan data respon dari relay langsung ke callback UDP parser
+        this.onDataCallback(payload);
+      }
+    }
+  }
+
+  sendWsFrame(payload) {
+    if (!this.wsSocket || this.wsSocket.destroyed) return;
+    const len = payload.length;
+    const mask = crypto.randomBytes(4);
+    let header;
+
+    if (len < 126) {
+      header = Buffer.alloc(6);
+      header[0] = 0x82;
+      header[1] = 0x80 | len;
+      mask.copy(header, 2);
+    } else if (len <= 0xffff) {
+      header = Buffer.alloc(8);
+      header[0] = 0x82;
+      header[1] = 0x80 | 126;
+      header.writeUInt16BE(len, 2);
+      mask.copy(header, 4);
+    } else {
+      header = Buffer.alloc(14);
+      header[0] = 0x82;
+      header[1] = 0x80 | 127;
+      header.writeBigUInt64BE(BigInt(len), 2);
+      mask.copy(header, 10);
+    }
+
+    const maskedPayload = Buffer.allocUnsafe(len);
+    for (let i = 0; i < len; i++) {
+      maskedPayload[i] = payload[i] ^ mask[i % 4];
+    }
+
+    this.wsSocket.write(Buffer.concat([header, maskedPayload]));
+  }
+
+  sendPacket(destHost, destPort, payload) {
+    if (!this.isReady) {
+      this.connect();
+      return;
+    }
+
+    // Packet UDP Frame: [Port (2B)] + [ATYP (1B)] + [Target IP/Domain] + [Length (2B)] + [Payload]
+    const portBuf = Buffer.alloc(2);
+    portBuf.writeUInt16BE(destPort, 0);
+
+    let atypBuf;
+    if (net.isIPv4(destHost)) {
+      atypBuf = Buffer.concat([
+        Buffer.from([0x01]),
+        Buffer.from(destHost.split('.').map(x => parseInt(x, 10)))
+      ]);
+    } else {
+      const hostBuf = Buffer.from(destHost, 'utf8');
+      atypBuf = Buffer.concat([
+        Buffer.from([0x02, hostBuf.length]),
+        hostBuf
+      ]);
+    }
+
+    const lenBuf = Buffer.alloc(2);
+    lenBuf.writeUInt16BE(payload.length, 0);
+
+    const frame = Buffer.concat([portBuf, atypBuf, lenBuf, payload]);
+    this.sendWsFrame(frame);
+  }
+
+  destroy() {
+    if (this.wsSocket) {
+      this.wsSocket.destroy();
+      this.wsSocket = null;
+    }
+    this.isReady = false;
+  }
+}
+
+// ==========================================
+// SERVER UTAMA MULTI-PROTOCOL PROXY
+// ==========================================
 const server = net.createServer({ 
   noDelay: true,
   allowHalfOpen: false,
@@ -214,9 +427,10 @@ const server = net.createServer({
 
   let isFirstPacket = true;
   let targetSocket = null;
-  let udpRelay = null;
   let socksState = 0;
   let httpBuffer = '';
+  let udpRelaySocket = null;
+  let workerTunnel = null;
 
   const bridgeSockets = (sockA, sockB) => {
     sockA.on('data', (d) => { 
@@ -243,7 +457,7 @@ const server = net.createServer({
     sockB.on('close', cleanup);
   };
 
-  // --- SOCKS5 HANDLER (TCP CONNECT & UDP ASSOCIATE) ---
+  // --- SOCKS5 HANDLER (TCP CONNECT & QUIC UDP ASSOCIATE VIA WORKER) ---
   const handleSocks5 = async (chunk) => {
     if (socksState === 0) {
       const nmethods = chunk[1];
@@ -282,80 +496,115 @@ const server = net.createServer({
     }
 
     if (socksState === 2) {
-      const cmd = chunk[1]; // 0x01 = CONNECT (TCP), 0x03 = UDP ASSOCIATE (QUIC/UDP)
+      const cmd = chunk[1];
 
+      // ==========================================
+      // COMMAND 0x03: SOCKS5 UDP ASSOCIATE (QUIC)
+      // DIUBAH KE WEBSOCKET XUDP TUNNEL
+      // ==========================================
       if (cmd === 0x03) {
-        // --- FITUR QUIC UDP RELAY ---
-        connData.type = 'SOCKS5 UDP (QUIC)';
-        connData.target = 'UDP Associate Relay';
+        connData.type = 'SOCKS5 UDP -> XUDP WS';
+        connData.target = `Worker: ${WORKER_RELAY_CONFIG.host}`;
         activeConnections.set(connId, connData);
 
-        udpRelay = dgram.createSocket('udp4');
+        udpRelaySocket = dgram.createSocket('udp4');
         let clientUdpAddr = null;
 
-        udpRelay.on('message', async (msg, rinfo) => {
-          // Tangkap paket dari browser client
-          if (!clientUdpAddr) {
-            clientUdpAddr = { address: rinfo.address, port: rinfo.port };
-          }
+        // Callback respon biner WebSocket dari Worker
+        const handleWorkerReply = (wsPayload) => {
+          if (!clientUdpAddr || wsPayload.length < 5) return;
 
-          if (rinfo.address === clientUdpAddr.address && rinfo.port === clientUdpAddr.port) {
-            // Header SOCKS5 UDP: [RSV(2), FRAG(1), ATYP(1), DST.ADDR, DST.PORT]
-            if (msg.length < 10) return;
-            const atyp = msg[3];
-            let offset = 4;
-            let destHost = '';
+          let offset = 0;
+          if (wsPayload[0] === 0x00 && wsPayload.length === 1) return; // Status byte OK
 
+          try {
+            const remotePort = wsPayload.readUInt16BE(offset);
+            const atyp = wsPayload[offset + 2];
+            offset += 3;
+
+            let ipBuf;
             if (atyp === 0x01) { // IPv4
-              destHost = `${msg[4]}.${msg[5]}.${msg[6]}.${msg[7]}`;
+              ipBuf = wsPayload.subarray(offset, offset + 4);
               offset += 4;
-            } else if (atyp === 0x03) { // Domain
-              const dlen = msg[4];
-              destHost = msg.slice(5, 5 + dlen).toString();
+            } else if (atyp === 0x02) { // Domain
+              const dlen = wsPayload[offset];
               offset += 1 + dlen;
+              ipBuf = Buffer.from([127, 0, 0, 1]);
+            } else if (atyp === 0x03) { // IPv6
+              ipBuf = wsPayload.subarray(offset, offset + 16);
+              offset += 16;
             } else {
               return;
             }
 
-            const destPort = msg.readUInt16BE(offset);
+            const dataLen = wsPayload.readUInt16BE(offset);
             offset += 2;
-            const payload = msg.slice(offset);
+            const actualPayload = wsPayload.subarray(offset, offset + dataLen);
 
-            connData.bytesIn += payload.length;
-            globalTotalBytesIn += payload.length;
+            // Susun kembali ke paket SOCKS5 UDP: [RSV(2), FRAG(1), ATYP(1), IP(4), PORT(2), DATA]
+            const s5Header = Buffer.alloc(10);
+            s5Header[0] = 0x00;
+            s5Header[1] = 0x00;
+            s5Header[2] = 0x00;
+            s5Header[3] = 0x01; // IPv4
+            ipBuf.copy(s5Header, 4, 0, Math.min(4, ipBuf.length));
+            s5Header.writeUInt16BE(remotePort, 8);
 
-            try {
-              const targetIp = await resolveDomain(destHost);
-              udpRelay.send(payload, destPort, targetIp);
-            } catch (_) {}
-          } else {
-            // Tangkap respon UDP dari server remote lalu bungkus balik ke format SOCKS5 UDP
-            const resHeader = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-            const ipParts = Buffer.from(rinfo.address.split('.').map(x => parseInt(x, 10)));
-            const portBuf = Buffer.alloc(2);
-            portBuf.writeUInt16BE(rinfo.port);
+            const outboundPacket = Buffer.concat([s5Header, actualPayload]);
+            connData.bytesOut += actualPayload.length;
+            globalTotalBytesOut += actualPayload.length;
 
-            const outboundPacket = Buffer.concat([resHeader, ipParts, portBuf, msg]);
-            connData.bytesOut += msg.length;
-            globalTotalBytesOut += msg.length;
+            udpRelaySocket.send(outboundPacket, clientUdpAddr.port, clientUdpAddr.address);
+          } catch (_) {}
+        };
 
-            if (clientUdpAddr) {
-              udpRelay.send(outboundPacket, clientUdpAddr.port, clientUdpAddr.address);
-            }
+        workerTunnel = new XUdpWorkerTunnel(handleWorkerReply);
+        workerTunnel.connect();
+
+        // Tangkap paket UDP lokal dari Browser
+        udpRelaySocket.on('message', async (msg, rinfo) => {
+          if (!clientUdpAddr) {
+            clientUdpAddr = { address: rinfo.address, port: rinfo.port };
           }
+
+          if (msg.length < 10) return;
+          const atyp = msg[3];
+          let offset = 4;
+          let destHost = '';
+
+          if (atyp === 0x01) {
+            destHost = `${msg[4]}.${msg[5]}.${msg[6]}.${msg[7]}`;
+            offset += 4;
+          } else if (atyp === 0x03) {
+            const dlen = msg[4];
+            destHost = msg.slice(5, 5 + dlen).toString();
+            offset += 1 + dlen;
+          } else {
+            return;
+          }
+
+          const destPort = msg.readUInt16BE(offset);
+          offset += 2;
+          const payload = msg.slice(offset);
+
+          connData.bytesIn += payload.length;
+          globalTotalBytesIn += payload.length;
+
+          // Forward paket UDP ke Worker Cloudflare lewat WebSocket
+          workerTunnel.sendPacket(destHost, destPort, payload);
         });
 
-        udpRelay.bind(0, () => {
-          const relayPort = udpRelay.address().port;
-          const boundAddr = clientSocket.localAddress || '0.0.0.0';
-          const ipParts = boundAddr.includes('.') ? boundAddr.split('.').map(x => parseInt(x, 10)) : [0, 0, 0, 0];
+        udpRelaySocket.bind(0, () => {
+          const relayPort = udpRelaySocket.address().port;
+          const boundAddr = clientSocket.localAddress || '127.0.0.1';
+          const ipParts = boundAddr.includes('.') ? boundAddr.split('.').map(Number) : [127, 0, 0, 1];
 
-          // Kirim balasan SOCKS5 sukses ke browser: Berikan port UDP yang siap menerima paket QUIC
+          // Kirim balasan sukses SOCKS5 ke browser dengan port UDP lokal kita
           const reply = Buffer.alloc(10);
-          reply[0] = 0x05; // VER
-          reply[1] = 0x00; // SUCCESS
-          reply[2] = 0x00; // RSV
-          reply[3] = 0x01; // IPv4
+          reply[0] = 0x05;
+          reply[1] = 0x00;
+          reply[2] = 0x00;
+          reply[3] = 0x01;
           reply[4] = ipParts[0];
           reply[5] = ipParts[1];
           reply[6] = ipParts[2];
@@ -364,22 +613,24 @@ const server = net.createServer({
           clientSocket.write(reply);
         });
 
-        // Kontrol TCP tetap terbuka sampai client memutuskan sesi
-        clientSocket.on('close', () => {
-          if (udpRelay) {
-            try { udpRelay.close(); } catch (_) {}
-          }
+        const cleanupUdp = () => {
           activeConnections.delete(connId);
-        });
-        clientSocket.on('error', () => {
-          if (udpRelay) {
-            try { udpRelay.close(); } catch (_) {}
+          if (udpRelaySocket) {
+            try { udpRelaySocket.close(); } catch (_) {}
+            udpRelaySocket = null;
           }
-        });
+          if (workerTunnel) {
+            workerTunnel.destroy();
+            workerTunnel = null;
+          }
+        };
+
+        clientSocket.on('close', cleanupUdp);
+        clientSocket.on('error', cleanupUdp);
         return;
       }
 
-      // Standar SOCKS5 TCP CONNECT (0x01)
+      // SOCKS5 TCP CONNECT BIASA (0x01)
       if (cmd !== 0x01) {
         clientSocket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
         return clientSocket.end();
@@ -401,7 +652,7 @@ const server = net.createServer({
         return clientSocket.end();
       }
 
-      connData.type = 'SOCKS5';
+      connData.type = 'SOCKS5 TCP';
       connData.target = `${targetHost}:${targetPort}`;
       activeConnections.set(connId, connData);
 
@@ -437,7 +688,7 @@ const server = net.createServer({
 
       const chunkStr = chunk.toString('utf-8');
 
-      // HTTP Web Dashboard & API
+      // Dashboard HTTP & API Control
       if (/^(GET|POST|PUT|DELETE|OPTIONS|HEAD)\s/i.test(chunkStr)) {
         httpBuffer += chunkStr;
 
@@ -456,6 +707,25 @@ const server = net.createServer({
         const dataStr = httpBuffer;
         const firstLine = dataStr.split('\r\n')[0];
         const pathUrl = firstLine.split(' ')[1] || '/';
+
+        // API: Set Upstream Worker VLESS Relay
+        if (pathUrl === '/api/set-worker-relay' && dataStr.startsWith('POST')) {
+          try {
+            const body = parseRequestBody(dataStr);
+            if (body.host) WORKER_RELAY_CONFIG.host = body.host.trim();
+            if (body.port) WORKER_RELAY_CONFIG.port = parseInt(body.port, 10) || 443;
+            if (body.wsPath) WORKER_RELAY_CONFIG.wsPath = body.wsPath.trim() || '/';
+            WORKER_RELAY_CONFIG.useTls = body.useTls !== undefined ? Boolean(body.useTls) : true;
+            saveData();
+            const resBody = JSON.stringify({ success: true, config: WORKER_RELAY_CONFIG });
+            clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          } catch (e) {
+            const errBody = JSON.stringify({ success: false, error: e.message });
+            clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${errBody.length}\r\nConnection: close\r\n\r\n${errBody}`);
+          }
+          clientSocket.end();
+          return;
+        }
 
         // API: Set DNS Langsung
         if (pathUrl.startsWith('/api/set-dns') && dataStr.startsWith('POST')) {
@@ -490,7 +760,7 @@ const server = net.createServer({
           return;
         }
 
-        // API: Set RAW TCP Langsung
+        // API: Set RAW TCP
         if (pathUrl === '/api/set-raw-tcp' && dataStr.startsWith('POST')) {
           const body = parseRequestBody(dataStr);
           RAW_TCP_CONFIG.enabled = !!body.enabled;
@@ -545,6 +815,7 @@ const server = net.createServer({
             proxyInfo: PROXY_SERVER_INFO,
             dnsConfig: DNS_CONFIG,
             rawTcpConfig: RAW_TCP_CONFIG,
+            workerRelayConfig: WORKER_RELAY_CONFIG,
             authMode: PROXY_AUTH_MODE,
             userList: userObjects,
             totalActive: activeList.length,
@@ -630,7 +901,7 @@ const server = net.createServer({
         }
       }
 
-      // STREAM RAW TCP / VLESS / TROJAN / SNI ROUTER
+      // STREAM RAW TCP / SNI ROUTER
       const sni = parseTlsSni(chunk);
       let destinationHost = '';
       let destinationPort = 443;
@@ -662,16 +933,8 @@ const server = net.createServer({
     }
   });
 
-  clientSocket.on('error', () => { 
-    activeConnections.delete(connId); 
-    if (targetSocket) targetSocket.destroy(); 
-    if (udpRelay) { try { udpRelay.close(); } catch (_) {} }
-  });
-  clientSocket.on('close', () => { 
-    activeConnections.delete(connId); 
-    if (targetSocket) targetSocket.destroy(); 
-    if (udpRelay) { try { udpRelay.close(); } catch (_) {} }
-  });
+  clientSocket.on('error', () => { activeConnections.delete(connId); if (targetSocket) targetSocket.destroy(); });
+  clientSocket.on('close', () => { activeConnections.delete(connId); if (targetSocket) targetSocket.destroy(); });
 });
 
 function parseTlsSni(buffer) {
@@ -755,7 +1018,7 @@ function renderDashboardHTML() {
     
     <div class="proxy-box">
       <div>
-        <div class="proxy-title">🚀 Endpoint Proxy (HTTP/S, SOCKS5 + UDP, RAW TCP)</div>
+        <div class="proxy-title">🚀 Endpoint Proxy (SOCKS5 + QUIC TUNNEL)</div>
         <div class="proxy-val" id="proxy_full_text">${PROXY_SERVER_INFO.fullProxy || 'Loading...'}</div>
       </div>
       <button class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('proxy_full_text').innerText)">📋 SALIN</button>
@@ -767,9 +1030,8 @@ function renderDashboardHTML() {
         <div class="val" style="color:#39ff14;" id="active_count">0</div>
       </div>
       <div class="badge">
-        <h4>Status DNS</h4>
-        <div class="val" style="color:#38bdf8; font-size:1.0rem;" id="badge_dns_mode">${DNS_CONFIG.mode}</div>
-        <div class="sub-val" id="badge_dns_target">${DNS_CONFIG.mode === 'DOH' ? DNS_CONFIG.dohUrl : DNS_CONFIG.udpServer + ':' + DNS_CONFIG.udpPort}</div>
+        <h4>Relay XUDP</h4>
+        <div class="val" style="color:#38bdf8; font-size:0.9rem;" id="badge_worker_host">${WORKER_RELAY_CONFIG.host}</div>
       </div>
       <div class="badge">
         <h4>Total In (RX)</h4>
@@ -781,15 +1043,45 @@ function renderDashboardHTML() {
       </div>
     </div>
 
+    <!-- PANEL 0: PENGATURAN UPSTREAM WORKER XUDP TUNNEL -->
+    <div class="panel" style="border-color:#eab308;">
+      <div class="section-title" style="margin:0; color:#fde047;">⚡ UPSTREAM WORKER / VLESS RELAY (QUIC CONVERTER)</div>
+      <div class="hint">Paket QUIC UDP dari browser dibungkus ke WebSocket TLS menuju Worker ini:</div>
+
+      <label style="font-size:0.75rem; color:#94a3b8; margin-top:8px; display:block;">Domain Worker / Bug Host:</label>
+      <input type="text" id="worker_host" value="${WORKER_RELAY_CONFIG.host}">
+
+      <div style="display:flex; gap:6px;">
+        <div style="flex:1;">
+          <label style="font-size:0.75rem; color:#94a3b8; margin-top:6px; display:block;">Port:</label>
+          <input type="number" id="worker_port" value="${WORKER_RELAY_CONFIG.port}">
+        </div>
+        <div style="flex:1;">
+          <label style="font-size:0.75rem; color:#94a3b8; margin-top:6px; display:block;">Path WS:</label>
+          <input type="text" id="worker_path" value="${WORKER_RELAY_CONFIG.wsPath}">
+        </div>
+      </div>
+
+      <label style="font-size:0.75rem; color:#94a3b8; margin-top:8px; display:block;">Gunakan TLS (HTTPS/WSS):</label>
+      <select id="worker_tls">
+        <option value="true" ${WORKER_RELAY_CONFIG.useTls ? 'selected' : ''}>🟢 Aktif (Port 443 - Rekomendasi)</option>
+        <option value="false" ${!WORKER_RELAY_CONFIG.useTls ? 'selected' : ''}>🔴 Nonaktif (Port 80)</option>
+      </select>
+
+      <button style="background:#eab308; color:#000;" onclick="saveWorkerRelay()">💾 SIMPAN UPSTREAM WORKER</button>
+      <div id="worker_toast" class="toast">✅ Pengaturan Upstream Worker Berhasil Disimpan!</div>
+    </div>
+
+    <!-- PANEL 1: PENGATURAN DNS RESOLVER -->
     <div class="panel" style="border-color:#38bdf8;">
       <div class="section-title" style="margin:0; color:#38bdf8;">🌐 PENGATURAN DNS RESOLVER</div>
-      <div class="hint">Pilih preset DoH/UDP atau custom untuk mempercepat pemutaran YouTube:</div>
+      <div class="hint">Pilih preset DoH/UDP atau custom untuk resolusi domain:</div>
 
       <select id="preset_select" onchange="applyPresetUI()">
         <option value="cf-doh" ${DNS_CONFIG.mode === 'DOH' && DNS_CONFIG.dohUrl.includes('cloudflare') ? 'selected' : ''}>⚡ Cloudflare DoH (Official)</option>
         <option value="google-doh" ${DNS_CONFIG.mode === 'DOH' && DNS_CONFIG.dohUrl.includes('google') ? 'selected' : ''}>⚡ Google DoH (Official)</option>
-        <option value="cf-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '1.1.1.1' ? 'selected' : ''}>🚀 Cloudflare UDP 1.1.1.1:53 (Paling Cepat)</option>
-        <option value="google-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '8.8.8.8' ? 'selected' : ''}>🚀 Google UDP 8.8.8.8:53 (Bagus untuk YouTube)</option>
+        <option value="cf-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '1.1.1.1' ? 'selected' : ''}>🚀 Cloudflare UDP 1.1.1.1:53</option>
+        <option value="google-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '8.8.8.8' ? 'selected' : ''}>🚀 Google UDP 8.8.8.8:53</option>
         <option value="quad9-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '9.9.9.9' ? 'selected' : ''}>🛡️ Quad9 UDP 9.9.9.9:53</option>
         <option value="quad9-doh">🛡️ Quad9 DoH (Security)</option>
         <option value="adguard-doh">🛑 AdGuard DoH (Adblock)</option>
@@ -804,7 +1096,7 @@ function renderDashboardHTML() {
 
       <div id="box_custom_udp" style="display:none; margin-top:8px;">
         <label style="font-size:0.75rem; color:#94a3b8;">IP Server DNS UDP:</label>
-        <input type="text" id="custom_udp_ip" placeholder="Contoh: 1.1.1.1 atau 8.8.8.8" value="${DNS_CONFIG.udpServer}">
+        <input type="text" id="custom_udp_ip" placeholder="Contoh: 1.1.1.1" value="${DNS_CONFIG.udpServer}">
         <label style="font-size:0.75rem; color:#94a3b8; margin-top:4px; display:block;">Port DNS UDP:</label>
         <input type="number" id="custom_udp_port" placeholder="Default: 53" value="${DNS_CONFIG.udpPort || 53}">
       </div>
@@ -813,6 +1105,7 @@ function renderDashboardHTML() {
       <div id="dns_toast" class="toast">✅ DNS Berhasil Diperbarui & Cache Direset!</div>
     </div>
 
+    <!-- PANEL 2: KONTROL RAW TCP PROXY -->
     <div class="panel" style="border-color:#a855f7;">
       <div class="section-title" style="margin:0; color:#c084fc;">🛠️ KONTROL PROXY RAW TCP</div>
       <label style="font-size:0.75rem; color:#94a3b8; margin-top:8px; display:block;">Status Raw TCP:</label>
@@ -830,14 +1123,13 @@ function renderDashboardHTML() {
       <button style="background:#a855f7; color:#fff;" onclick="saveRawTcp()">💾 SIMPAN PENGATURAN RAW TCP</button>
     </div>
 
+    <!-- PANEL 3: USER & AUTH -->
     <div class="panel">
       <div class="section-title" style="margin:0;">👤 USER & PASSWORD PROXY</div>
-      <div class="hint">Gunakan mode NONE untuk public/bebas auth:</div>
-
       <div style="margin-top:10px;">
         <label style="font-size:0.75rem; color:#94a3b8;">Enforce Mode:</label>
         <select id="select_auth_mode" onchange="changeAuthMode()">
-          <option value="NONE" ${PROXY_AUTH_MODE === 'NONE' ? 'selected' : ''}>Tanpa Auth (Public Proxy - Rekomendasi)</option>
+          <option value="NONE" ${PROXY_AUTH_MODE === 'NONE' ? 'selected' : ''}>Tanpa Auth (Public Proxy)</option>
           <option value="AUTH" ${PROXY_AUTH_MODE === 'AUTH' ? 'selected' : ''}>Wajib User & Password (Private Proxy)</option>
         </select>
       </div>
@@ -853,6 +1145,7 @@ function renderDashboardHTML() {
       <button onclick="addUser()">+ TAMBAH USER PROXY</button>
     </div>
 
+    <!-- LIVE CONNECTIONS -->
     <div class="section-title">🟢 LIVE CONNECTIONS (REALTIME)</div>
     <div class="conn-list" id="conn_container"></div>
   </div>
@@ -871,15 +1164,8 @@ function renderDashboardHTML() {
           document.getElementById('proxy_full_text').innerText = data.proxyInfo.fullProxy;
         }
 
-        if (data.dnsConfig) {
-          document.getElementById('badge_dns_mode').innerText = data.dnsConfig.mode + ' (' + (data.dnsConfig.activeName || 'Active') + ')';
-          document.getElementById('badge_dns_target').innerText = data.dnsConfig.mode === 'DOH' 
-            ? data.dnsConfig.dohUrl 
-            : data.dnsConfig.udpServer + ':' + data.dnsConfig.udpPort;
-        }
-
-        if (data.authMode) {
-          document.getElementById('select_auth_mode').value = data.authMode;
+        if (data.workerRelayConfig) {
+          document.getElementById('badge_worker_host').innerText = data.workerRelayConfig.host;
         }
 
         renderUsers(data.userList);
@@ -905,7 +1191,7 @@ function renderDashboardHTML() {
     function renderUsers(users) {
       const tbody = document.getElementById('user_list_body');
       if (!users || users.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3" style="color:#64748b; text-align:center;">Belum ada user proxy ditambahkan.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="3" style="color:#64748b; text-align:center;">Belum ada user proxy.</td></tr>';
         return;
       }
       tbody.innerHTML = users.map(u => \`
@@ -921,6 +1207,25 @@ function renderDashboardHTML() {
       const val = document.getElementById('preset_select').value;
       document.getElementById('box_custom_doh').style.display = (val === 'custom_doh') ? 'block' : 'none';
       document.getElementById('box_custom_udp').style.display = (val === 'custom_udp') ? 'block' : 'none';
+    }
+
+    async function saveWorkerRelay() {
+      const host = document.getElementById('worker_host').value.trim();
+      const port = document.getElementById('worker_port').value.trim();
+      const wsPath = document.getElementById('worker_path').value.trim();
+      const useTls = document.getElementById('worker_tls').value === 'true';
+
+      const res = await fetch('/api/set-worker-relay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, port, wsPath, useTls })
+      });
+      if (res.ok) {
+        const toast = document.getElementById('worker_toast');
+        toast.style.display = 'block';
+        setTimeout(() => toast.style.display = 'none', 3000);
+        fetchStats();
+      }
     }
 
     async function saveDns() {
@@ -944,8 +1249,7 @@ function renderDashboardHTML() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      const data = await res.json();
-      if (data.success) {
+      if (res.ok) {
         const toast = document.getElementById('dns_toast');
         toast.style.display = 'block';
         setTimeout(() => toast.style.display = 'none', 3000);
@@ -972,7 +1276,7 @@ function renderDashboardHTML() {
     async function addUser() {
       const u = document.getElementById('new_proxy_user').value.trim();
       const p = document.getElementById('new_proxy_pass').value.trim();
-      if (!u || !p) return alert('Isi user dan password proxy!');
+      if (!u || !p) return alert('Isi user dan password!');
       const res = await fetch('/api/manage-users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1012,5 +1316,5 @@ function renderDashboardHTML() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Server] Multi-Protocol Proxy & Dashboard running on port ${PORT}`);
+  console.log(`[Server] Multi-Protocol Proxy (SOCKS5 QUIC Converter) running on port ${PORT}`);
 });
